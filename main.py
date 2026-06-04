@@ -1,19 +1,12 @@
 from fastapi import FastAPI, BackgroundTasks, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 from gtts import gTTS
-import subprocess, os, uuid, httpx, asyncio
+import subprocess, os, uuid
 
-app = FastAPI(title="StartVideoTube API", version="3.0")
-
-JOBS = {}
-
-# ─── Google Drive Upload via n8n webhook ───────────────────────────
-# No necesitamos credenciales de Drive en el servidor
-# El servidor genera el video y lo devuelve como bytes
-# n8n lo recibe y lo sube a Drive
+app = FastAPI(title="StartVideoTube API", version="4.0")
 
 class VideoRequest(BaseModel):
     script: str
@@ -21,24 +14,33 @@ class VideoRequest(BaseModel):
     tema: str
     fecha: Optional[str] = ""
 
-def generate_video_task(job_id: str, script: str, canal: str, tema: str, fecha: str):
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "StartVideoTube v4"}
+
+@app.post("/generate-video")
+def create_video(req: VideoRequest):
+    """
+    Genera video sincrónicamente y devuelve el MP4 como respuesta binaria.
+    n8n lo recibe directamente y lo sube a Drive.
+    """
+    job_id = str(uuid.uuid4())[:8]
+    fecha = req.fecha or datetime.now().strftime("%Y-%m-%d_%H-%M")
+    canal_slug = req.canal.replace(" ", "_").replace("/", "_")
+    
+    OUTPUT_DIR = "/tmp/videos"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    audio_file = f"/tmp/audio_{job_id}.mp3"
+    video_name = f"video_{canal_slug}_{fecha}_{job_id}.mp4"
+    video_path = f"{OUTPUT_DIR}/{video_name}"
+    
     try:
-        JOBS[job_id]["status"] = "processing"
-        
-        # Directorio temporal en Railway
-        OUTPUT_DIR = "/tmp/videos"
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        
-        canal_slug = canal.replace(" ", "_").replace("/", "_")
-        audio_file = f"/tmp/audio_{job_id}.mp3"
-        video_name = f"video_{canal_slug}_{fecha}_{job_id[:8]}.mp4"
-        video_path = os.path.join(OUTPUT_DIR, video_name)
-        
-        # Generar audio con gTTS
-        tts = gTTS(text=script[:3000], lang='es', slow=False)
+        # Generar audio
+        tts = gTTS(text=req.script[:3000], lang='es', slow=False)
         tts.save(audio_file)
         
-        # Generar video con ffmpeg - fondo negro + audio
+        # Generar video negro con audio
         subprocess.run([
             "ffmpeg", "-y",
             "-f", "lavfi",
@@ -47,55 +49,37 @@ def generate_video_task(job_id: str, script: str, canal: str, tema: str, fecha: 
             "-c:v", "libx264",
             "-c:a", "aac",
             "-b:a", "192k",
-            "-pix_fmt", "yuv420x",
+            "-pix_fmt", "yuv420p",
             "-shortest",
             video_path
-        ], check=True, capture_output=True)
+        ], check=True, capture_output=True, timeout=300)
         
         if os.path.exists(audio_file):
             os.remove(audio_file)
-            
-        JOBS[job_id].update({
-            "status": "done",
-            "video_path": video_path,
-            "video_name": video_name,
-            "download_url": f"/video-file/{video_name}",
-            "error": ""
-        })
         
+        # Devolver el video como respuesta binaria directa
+        with open(video_path, "rb") as f:
+            video_bytes = f.read()
+        
+        # Limpiar
+        os.remove(video_path)
+        
+        return Response(
+            content=video_bytes,
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": f"attachment; filename={video_name}",
+                "X-Video-Name": video_name
+            }
+        )
+        
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Video generation timed out")
     except Exception as e:
-        JOBS[job_id].update({"status": "error", "error": str(e)})
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "service": "StartVideoTube v3"}
-
-@app.post("/generate-video")
-def create_video(req: VideoRequest, background_tasks: BackgroundTasks):
-    job_id = str(uuid.uuid4())
-    fecha = req.fecha or datetime.now().strftime("%Y-%m-%d_%H-%M")
-    JOBS[job_id] = {"status": "pending", "video_path": "", "video_name": "", "download_url": "", "error": ""}
-    background_tasks.add_task(generate_video_task, job_id, req.script, req.canal, req.tema, fecha)
-    return {"job_id": job_id, "status": "pending"}
-
-@app.get("/video-status/{job_id}")
-def get_status(job_id: str):
-    if job_id not in JOBS:
-        return {"status": "not_found"}
-    return {"job_id": job_id, **JOBS[job_id]}
-
-@app.get("/video-file/{video_name}")
-def download_video(video_name: str):
-    from fastapi.responses import FileResponse
-    video_path = f"/tmp/videos/{video_name}"
-    if not os.path.exists(video_path):
-        raise HTTPException(status_code=404, detail="Video not found or expired")
-    return FileResponse(
-        video_path,
-        media_type="video/mp4",
-        filename=video_name,
-        headers={"Content-Disposition": f"attachment; filename={video_name}"}
-    )
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if os.path.exists(audio_file):
+            os.remove(audio_file)
 
 if __name__ == "__main__":
     import uvicorn
