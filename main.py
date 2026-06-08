@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("startvideotube")
 
 # ─── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="StartVideoTube", version="5.3")
+app = FastAPI(title="StartVideoTube", version="5.3.3")
 
 # ─── Variables de entorno ──────────────────────────────────────────────────────
 FISH_API_KEY  = os.environ.get("FISH_API_KEY", "")
