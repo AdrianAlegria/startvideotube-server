@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+gtts
+httpx
+python-multipart
+pydantic
+Pillow
+reportlab
