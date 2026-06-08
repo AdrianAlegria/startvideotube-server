@@ -4,3 +4,4 @@ gtts
 httpx
 python-multipart
 pydantic
+Pillow
